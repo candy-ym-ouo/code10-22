@@ -1,0 +1,241 @@
+# 全栈仓库统一 CI 门禁（可复用工作流）
+#
+# 五个门禁彼此独立、并行执行，任一失败整个调用方工作流即为失败：
+#   1. lockfile   —— 依赖必须按 package-lock.json 锁定安装，锁文件不同步即失败
+#   2. migrations —— Prisma 迁移必须能在全新数据库干净部署，且部署后与 schema.prisma 无漂移
+#   3. typecheck  —— 四个工作区全部通过 TypeScript 类型检查
+#   4. unit-test  —— 全部工作区单元测试
+#   5. web-build  —— 前端生产构建必须成功
+#
+# 缓存按 job 隔离：key 含 github.job，各门禁之间绝不串用缓存；
+# 缓存只用于加速，安装始终走 npm ci，缓存损坏不会改变安装结果。
+name: CI Gates
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "门禁环境标识（仅用于日志）"
+        required: false
+        type: string
+        default: "ci"
+
+# 门禁只读仓库内容，不需要任何写权限
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: "1"
+  NPM_CONFIG_UPDATE_NOTIFIER: "false"
+  NPM_CONFIG_FUND: "false"
+
+jobs:
+  # 1. 依赖锁定：必须存在锁文件且与各 package.json 严格一致，否则 npm ci 直接失败
+  lockfile:
+    name: "门禁：依赖锁定"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: npm 缓存（与其它 job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ci-${{ runner.os }}-npm-${{ github.job }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ci-${{ runner.os }}-npm-${{ github.job }}-
+
+      - name: 校验锁文件存在
+        run: |
+          test -f package-lock.json || {
+            echo "::error::缺少 package-lock.json，禁止在无锁文件的情况下安装/发布"
+            exit 1
+          }
+
+      # --ignore-scripts：本 job 只验证锁定一致性，最快且最确定；
+      # npm ci 在锁文件与 package.json 不一致时会以非零码退出
+      - name: 按锁文件安装（锁文件不同步即失败）
+        run: npm ci --ignore-scripts
+
+      # 二次复核：重新解析依赖树后锁文件不应产生任何 diff，
+      # 覆盖 npm ci 不报错但锁文件陈旧/手工篡改的情况
+      - name: 复核锁文件与 package.json 无偏差
+        run: |
+          npm install --package-lock-only --ignore-scripts
+          if ! git diff --quiet -- package-lock.json; then
+            echo "::error::package-lock.json 与 package.json 不同步，请在本地运行 npm install 并提交更新后的锁文件"
+            git --no-pager diff -- package-lock.json
+            exit 1
+          fi
+
+  # 2. 迁移检查：schema 合法 → 迁移可在全新库部署 → 部署结果与 schema 无漂移 → 历史状态干净
+  migrations:
+    name: "门禁：数据库迁移"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres?schema=public
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: npm 缓存（与其它 job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ci-${{ runner.os }}-npm-${{ github.job }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ci-${{ runner.os }}-npm-${{ github.job }}-
+
+      - name: 按锁文件安装
+        run: npm ci
+
+      - name: 校验 Prisma schema
+        run: npx prisma validate --schema apps/api/prisma/schema.prisma
+
+      - name: 在全新 PostgreSQL 上部署全部迁移
+        working-directory: apps/api
+        run: npx prisma migrate deploy
+
+      # migrate diff --exit-code：无差异 0，有漂移 2，出错 1
+      - name: 检测迁移与 schema 漂移
+        working-directory: apps/api
+        run: |
+          npx prisma migrate diff \
+            --from-schema-datasource prisma/schema.prisma \
+            --to-schema-datamodel prisma/schema.prisma \
+            --exit-code
+
+      - name: 校验迁移历史完整
+        working-directory: apps/api
+        run: npx prisma migrate status
+
+  # 3. 类型检查：contracts 先构建（其余工作区引用其 d.ts），再全量 typecheck
+  typecheck:
+    name: "门禁：类型检查"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: npm 缓存（与其它 job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ci-${{ runner.os }}-npm-${{ github.job }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ci-${{ runner.os }}-npm-${{ github.job }}-
+
+      - name: 按锁文件安装
+        run: npm ci
+
+      - name: 生成 Prisma Client（类型依赖）
+        run: npm run db:generate
+
+      - name: 全工作区 TypeScript 类型检查
+        run: npm run typecheck
+
+  # 4. 单元测试：contracts / api / web / worker 全部工作区
+  unit-test:
+    name: "门禁：单元测试"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: npm 缓存（与其它 job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ci-${{ runner.os }}-npm-${{ github.job }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ci-${{ runner.os }}-npm-${{ github.job }}-
+
+      - name: 按锁文件安装
+        run: npm ci
+
+      - name: 生成 Prisma Client
+        run: npm run db:generate
+
+      - name: 构建共享 contracts
+        run: npm run build -w @practice/contracts
+
+      - name: 运行全部单元测试
+        run: npm test
+
+  # 5. 前端构建：生产构建必须成功（contracts → vue-tsc 类型检查 → vite 打包）
+  web-build:
+    name: "门禁：前端构建"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: npm 缓存（与其它 job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ci-${{ runner.os }}-npm-${{ github.job }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ci-${{ runner.os }}-npm-${{ github.job }}-
+
+      - name: 按锁文件安装
+        run: npm ci
+
+      - name: 构建共享 contracts
+        run: npm run build -w @practice/contracts
+
+      - name: 前端生产构建
+        run: npm run build -w @practice/web
+
+      - name: 校验构建产物存在
+        run: |
+          test -f apps/web/dist/index.html || {
+            echo "::error::前端构建未产出 apps/web/dist/index.html"
+            exit 1
+          }
+          test "$(find apps/web/dist/assets -name '*.js' | wc -l)" -gt 0

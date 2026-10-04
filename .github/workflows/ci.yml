@@ -1,0 +1,24 @@
+# CI 入口：每个 PR / 主干提交都必须通过全部门禁
+# 门禁定义见 ci-gates.yml（五个 job 全部通过本工作流才算成功）
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的新提交自动取消旧运行，节约额度，且状态始终对应最新提交
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: 持续集成门禁
+    uses: ./.github/workflows/ci-gates.yml
+    with:
+      environment: ${{ github.event_name }}

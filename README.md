@@ -101,6 +101,18 @@ npm run test:e2e
 - 所有资源查询都带 `userId` 条件，无法通过 ID 访问其他用户资源。
 - 删除练习进入后台清理队列，失败时保留 `DELETE_FAILED` 以便重试和审计。
 
+## 持续集成门禁
+
+`.github/workflows/` 定义了五道彼此独立、并行执行的门禁，PR 和 `main` 提交必须全部通过（见 `ci-gates.yml`）：
+
+1. **依赖锁定**：必须存在 `package-lock.json`，`npm ci` 成功，且重新解析依赖树后锁文件无 diff；禁止未锁定的依赖进入构建。
+2. **迁移检查**：在全新的 PostgreSQL 16 上 `prisma migrate deploy`，随后用 `migrate diff --exit-code` 确认迁移结果与 `schema.prisma` 无漂移，并检查迁移历史完整。
+3. **类型检查**：`npm run typecheck` 覆盖全部四个工作区。
+4. **单元测试**：`npm test` 覆盖 contracts / api / web / worker。
+5. **前端构建**：`@practice/web` 生产构建必须产出 `apps/web/dist`。
+
+每个 job 只使用自己的 npm 缓存（key 含 job 名，互不串用）；缓存仅用于加速，安装始终走 `npm ci`。发布工作流（`release.yml`，推送 `v*` 标签触发）复用同一套门禁作为前置 job，**任一门禁失败则构建与 Release 发布整体跳过，绝不产出发布物**。建议在 GitHub 分支保护中将 `CI` 工作流设为必需检查。
+
 ## 项目文档
 
 - [API 契约](./docs/api.md)

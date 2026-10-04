@@ -1,0 +1,113 @@
+# 发布：只有五道 CI 门禁全部通过后才执行，门禁失败则直接短路、不会产生任何发布物
+#
+# 触发方式：推送 v* 标签，或在 Actions 页面手动指定标签运行。
+# 产物：API / Worker 的 Node 构建产物、Web 静态站点（apps/web/dist），
+#       作为 Release Assets 上传；此处不触碰任何生产环境。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签（需已存在）"
+        required: true
+        type: string
+
+# 顶层只读；需要写 Release 的 job 单独提权，遵循最小权限
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # 复用与日常 CI 完全相同的门禁：任一失败，后续 publish job 被跳过，绝不发布
+  gates:
+    name: 发布前置门禁
+    uses: ./.github/workflows/ci-gates.yml
+    with:
+      environment: release
+
+  publish:
+    name: 构建并发布 Release
+    needs: gates
+    # needs 语义保证门禁失败时本 job 跳过（skipped 即不发布）
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: 检出对应标签
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: 安装 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      # 发布 job 有独立缓存命名空间，与五个门禁 job 物理隔离
+      - name: npm 缓存（发布 job 独立）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: release-${{ runner.os }}-npm-${{ github.job }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            release-${{ runner.os }}-npm-${{ github.job }}-
+
+      - name: 确认标签存在
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git rev-parse "refs/tags/$TAG" >/dev/null
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # 发布构建再次严格按锁文件安装；不允许任何未锁定依赖进入产物
+      - name: 按锁文件安装
+        run: npm ci
+
+      - name: 生成 Prisma Client
+        run: npm run db:generate
+
+      - name: 全量生产构建
+        run: npm run build
+
+      - name: 校验发布产物齐全
+        run: |
+          test -d apps/api/dist
+          test -d apps/worker/dist
+          test -f apps/web/dist/index.html
+
+      - name: 打包 Web 静态站点
+        working-directory: apps/web
+        run: tar -czf "../../web-dist-${{ steps.tag.outputs.tag }}.tar.gz" -C dist .
+
+      - name: 打包 API 构建产物
+        working-directory: apps/api
+        run: tar -czf "../../api-dist-${{ steps.tag.outputs.tag }}.tar.gz" -C dist .
+
+      - name: 打包 Worker 构建产物
+        working-directory: apps/worker
+        run: tar -czf "../../worker-dist-${{ steps.tag.outputs.tag }}.tar.gz" -C dist .
+
+      - name: 创建 GitHub Release 并上传产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，仅补传缺失产物"
+            gh release upload "$TAG" --clobber \
+              "web-dist-$TAG.tar.gz" "api-dist-$TAG.tar.gz" "worker-dist-$TAG.tar.gz"
+          else
+            gh release create "$TAG" \
+              --title "Release $TAG" \
+              --notes-from-tag \
+              "web-dist-$TAG.tar.gz" "api-dist-$TAG.tar.gz" "worker-dist-$TAG.tar.gz"
+          fi
