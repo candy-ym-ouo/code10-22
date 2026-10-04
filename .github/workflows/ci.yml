@@ -1,0 +1,267 @@
+name: CI
+
+# 全栈门禁：依赖锁定 / 迁移检查 / 类型检查 / 单测 / 前端构建。
+# 任意 job 失败都会阻止本工作流通过；release job 依赖全部检查 job，失败不得发布。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# 同一分支上的新运行取消旧运行；发布（tag）运行不互相取消。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+# 每个 job 独立 checkout、独立 npm ci、独立缓存，缓存键带 job 名隔离，
+# 不跨 job 复用 node_modules 或构建产物。
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # 门禁 1：依赖锁定
+  # npm ci 要求 package-lock.json 与 package.json 严格同步，否则直接失败；
+  # 再加一道显式的 npm ls 校验，确保锁文件解析出的树无破损依赖。
+  lockfile:
+    name: "门禁 · 依赖锁定"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检出锁文件与包清单
+        run: |
+          test -f package-lock.json || { echo "::error::缺少 package-lock.json，禁止未锁定依赖进入流水线"; exit 1; }
+      - name: 安装 Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # 缓存仅服务于本 job，键含 job 名、OS、Node 版本与锁文件哈希。
+      - name: 恢复 npm 缓存（lockfile job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-
+      - name: 按锁文件全新安装（不同步则失败）
+        run: npm ci --no-audit --no-fund
+      - name: 校验依赖树完整
+        run: npm ls --omit=optional --workspaces
+
+  # 门禁 2：数据库迁移检查
+  # - prisma validate：schema 与 migrations 目录格式合法
+  # - migrate deploy：在全新 PostgreSQL 上重放全部迁移，SQL 必须可执行
+  # - migrate diff：重放后的数据库结构必须与 schema.prisma 完全一致（漂移即失败）
+  # - migrate status：不得存在未应用或未记录的迁移
+  migrations:
+    name: "门禁 · 数据库迁移"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+      SHADOW_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_shadow?schema=public
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 恢复 npm 缓存（migrations job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-
+      - name: 按锁文件全新安装
+        run: npm ci --no-audit --no-fund
+      - name: 创建影子数据库
+        run: |
+          PGPASSWORD=ci psql -h localhost -U ci -d postgres \
+            -v ON_ERROR_STOP=1 -c "CREATE DATABASE ci_shadow;"
+      - name: 校验迁移锁 provider
+        run: |
+          grep -Eq '^provider[[:space:]]*=[[:space:]]*"postgresql"$' \
+            apps/api/prisma/migrations/migration_lock.toml
+      - name: 校验 Prisma schema
+        run: npm exec --workspace=@practice/api -- prisma validate
+      - name: 生成 Prisma Client
+        run: npm run db:generate -w @practice/api
+      - name: 在全新数据库上重放全部迁移
+        run: npm run db:deploy -w @practice/api
+      - name: 校验迁移状态（不得有未应用迁移）
+        run: npm run db:status
+      - name: 漂移检测：迁移历史必须与 schema 一致
+        run: |
+          diff_output="$(npm exec --workspace=@practice/api -- prisma migrate diff \
+            --from-url "$DATABASE_URL" \
+            --to-schema-datamodel apps/api/prisma/schema.prisma \
+            --shadow-database-url "$SHADOW_DATABASE_URL" --exit-code)" || {
+              echo "::error::迁移与 schema.prisma 存在漂移，请先执行 prisma migrate dev 提交迁移"
+              echo "$diff_output"
+              exit 1
+            }
+          echo "$diff_output"
+
+  # 门禁 3：类型检查（契约包先构建，供 web/api 消费 dist 声明）
+  typecheck:
+    name: "门禁 · 类型检查"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 恢复 npm 缓存（typecheck job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-
+      - name: 按锁文件全新安装
+        run: npm ci --no-audit --no-fund
+      - name: 全仓 TypeScript 类型检查
+        run: npm run typecheck
+
+  # 门禁 4：单元测试（contracts / api / web / worker）
+  test:
+    name: "门禁 · 单元测试"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 恢复 npm 缓存（test job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-
+      - name: 按锁文件全新安装
+        run: npm ci --no-audit --no-fund
+      # Prisma Client 由 postinstall 之外的命令生成，api 类型导入需要它。
+      # 仅给一个占位连接串，generate 不连接数据库。
+      - name: 生成 Prisma Client
+        run: npm run db:generate -w @practice/api
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+      - name: 运行全部工作区单元测试
+        run: npm run test
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+          REDIS_URL: redis://localhost:6379
+          JWT_ACCESS_SECRET: ci-only-placeholder-secret-at-least-32-chars
+          REFRESH_TOKEN_PEPPER: ci-only-placeholder-pepper-at-least-32-chars
+          S3_ENDPOINT: http://localhost:9000
+          S3_ACCESS_KEY: ci
+          S3_SECRET_KEY: ci-placeholder-secret
+          PUBLIC_API_ORIGIN: http://localhost:3000
+          WEB_ORIGIN: http://localhost:5173
+
+  # 门禁 5：前端生产构建（vue-tsc + vite build）
+  web-build:
+    name: "门禁 · 前端构建"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 恢复 npm 缓存（web-build job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-
+      - name: 按锁文件全新安装
+        run: npm ci --no-audit --no-fund
+      - name: 构建共享契约包
+        run: npm run build -w @practice/contracts
+      - name: 前端生产构建
+        run: npm run build -w @practice/web
+      - name: 归档前端构建产物（仅供核查，不作为发布物）
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist-${{ github.sha }}
+          path: apps/web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # 发布门禁：只有五个检查 job 全部成功才执行；任何一个失败该 job 被跳过，
+  # 不产生 release 与发布物。仅在打 v* tag 时运行。
+  release:
+    name: "发布 · 全部门禁通过后打包"
+    needs: [lockfile, migrations, typecheck, test, web-build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 恢复 npm 缓存（release job 隔离）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ github.job }}-ubuntu-node${{ env.NODE_VERSION }}-
+      - name: 按锁文件全新安装
+        run: npm ci --no-audit --no-fund
+      - name: 生成 Prisma Client
+        run: npm run db:generate -w @practice/api
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+      # 重新构建一次，发布物只来自本 job 的干净工作区，不使用其他 job 的产物。
+      - name: 全量构建（contracts / api / worker / web）
+        run: npm run build
+      - name: 校验待发布版本号与 tag 一致
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg_version" ]; then
+            echo "::error::$GITHUB_REF_NAME 与 package.json 版本 $pkg_version 不一致，拒绝发布"
+            exit 1
+          fi
+      - name: 打包发布物（不含 node_modules）
+        run: |
+          mkdir -p release
+          tar -czf release/app.tar.gz \
+            package.json package-lock.json \
+            apps/api/package.json apps/api/dist apps/api/prisma \
+            apps/worker/package.json apps/worker/dist \
+            apps/web/dist \
+            packages/contracts/package.json packages/contracts/dist
+      - name: 上传发布物
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/app.tar.gz
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

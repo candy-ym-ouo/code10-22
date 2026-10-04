@@ -104,6 +104,7 @@ npm run test:e2e
 ## 项目文档
 
 - [API 契约](./docs/api.md)
+- [持续集成门禁](./docs/ci.md)
 - [部署说明](./docs/deployment.md)
 - [备份与恢复](./docs/backup-restore.md)
 

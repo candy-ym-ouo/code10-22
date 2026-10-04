@@ -20,6 +20,7 @@
     "db:generate": "npm run prisma:generate -w @practice/api",
     "db:migrate": "npm run prisma:migrate -w @practice/api",
     "db:deploy": "npm run prisma:deploy -w @practice/api",
+    "db:status": "npm run prisma:status -w @practice/api",
     "db:studio": "npm run prisma:studio -w @practice/api",
     "predev": "npm run build -w @practice/contracts",
     "pretypecheck": "npm run build -w @practice/contracts",
